@@ -8,14 +8,16 @@ const userSchema = new mongoose.Schema({
     unique: true,
     trim: true,
     minlength: 3,
-    maxlength: 20
+    maxlength: 20,
+    match: /^[a-zA-Z0-9_\u4e00-\u9fa5]+$/
   },
   email: {
     type: String,
     required: true,
     unique: true,
     trim: true,
-    lowercase: true
+    lowercase: true,
+    match: /^[^\s@]+@[^\s@]+\.[^\s@]+$/
   },
   password: {
     type: String,
@@ -34,145 +36,136 @@ const userSchema = new mongoose.Schema({
   isAdmin: {
     type: Boolean,
     default: false
-  }
-}, {
-  timestamps: true
-});
-
-// 分类模型
-const categorySchema = new mongoose.Schema({
-  name: {
-    type: String,
-    required: true,
-    unique: true,
-    trim: true
   },
-  description: {
-    type: String,
-    default: ''
-  },
-  color: {
-    type: String,
-    default: '#007bff'
-  }
-}, {
-  timestamps: true
-});
-
-// 文章模型
-const postSchema = new mongoose.Schema({
-  title: {
-    type: String,
-    required: true,
-    trim: true,
-    maxlength: 200
-  },
-  content: {
-    type: String,
-    required: true
-  },
-  summary: {
-    type: String,
-    maxlength: 300
-  },
-  coverImage: {
-    type: String,
-    default: ''
-  },
-  author: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User',
-    required: true
-  },
-  category: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Category',
-    required: true
-  },
-  tags: [{
-    type: String,
-    trim: true
-  }],
-  isPublished: {
+  // 邮箱验证相关
+  isEmailVerified: {
     type: Boolean,
     default: false
   },
-  publishedAt: {
+  emailVerifyToken: {
+    type: String
+  },
+  emailVerifyExpires: {
     type: Date
   },
-  viewCount: {
+  // 密码重置相关
+  passwordResetToken: {
+    type: String
+  },
+  passwordResetExpires: {
+    type: Date
+  },
+  passwordChangedAt: {
+    type: Date
+  },
+  // 登录相关
+  lastLoginAt: {
+    type: Date
+  },
+  loginAttempts: {
     type: Number,
     default: 0
   },
-  likeCount: {
-    type: Number,
-    default: 0
+  lockUntil: {
+    type: Date
   },
-  commentCount: {
-    type: Number,
-    default: 0
+  // 账户状态
+  isActive: {
+    type: Boolean,
+    default: true
+  },
+  isBanned: {
+    type: Boolean,
+    default: false
+  },
+  banReason: {
+    type: String
+  },
+  banExpires: {
+    type: Date
   }
 }, {
   timestamps: true
 });
 
-// 评论模型
-const commentSchema = new mongoose.Schema({
-  content: {
-    type: String,
-    required: true,
-    trim: true,
-    maxlength: 1000
-  },
-  author: {
-    name: {
-      type: String,
-      required: true,
-      trim: true
-    },
-    email: {
-      type: String,
-      required: true,
-      trim: true
-    },
-    website: {
-      type: String,
-      trim: true
-    }
-  },
-  post: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Post',
-    required: true
-  },
-  parentComment: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Comment'
-  },
-  isApproved: {
-    type: Boolean,
-    default: false
-  },
-  ip: {
-    type: String
-  }
-}, {
-  timestamps: true
+// 虚拟字段：是否被锁定
+userSchema.virtual('isLocked').get(function() {
+  return !!(this.lockUntil && this.lockUntil > Date.now());
 });
 
 // 索引
-postSchema.index({ title: 'text', content: 'text' });
-postSchema.index({ createdAt: -1 });
-postSchema.index({ isPublished: 1 });
+userSchema.index({ email: 1 });
+userSchema.index({ username: 1 });
+userSchema.index({ emailVerifyToken: 1 });
+userSchema.index({ passwordResetToken: 1 });
+
+// 中间件：保存前清理过期的令牌
+userSchema.pre('save', function(next) {
+  // 清理过期的邮箱验证令牌
+  if (this.emailVerifyExpires && this.emailVerifyExpires < Date.now()) {
+    this.emailVerifyToken = undefined;
+    this.emailVerifyExpires = undefined;
+  }
+  
+  // 清理过期的密码重置令牌
+  if (this.passwordResetExpires && this.passwordResetExpires < Date.now()) {
+    this.passwordResetToken = undefined;
+    this.passwordResetExpires = undefined;
+  }
+  
+  next();
+});
+
+// 实例方法：增加登录失败次数
+userSchema.methods.incLoginAttempts = function() {
+  // 如果有之前的锁定且已过期，则重置
+  if (this.lockUntil && this.lockUntil < Date.now()) {
+    return this.updateOne({
+      $unset: {
+        loginAttempts: 1,
+        lockUntil: 1
+      }
+    });
+  }
+  
+  const updates = { $inc: { loginAttempts: 1 } };
+  
+  // 如果超过最大尝试次数且未锁定，则锁定账户
+  const maxAttempts = 5;
+  const lockTime = 2 * 60 * 60 * 1000; // 2小时
+  
+  if (this.loginAttempts + 1 >= maxAttempts && !this.isLocked) {
+    updates.$set = {
+      lockUntil: Date.now() + lockTime
+    };
+  }
+  
+  return this.updateOne(updates);
+};
+
+// 实例方法：重置登录尝试
+userSchema.methods.resetLoginAttempts = function() {
+  return this.updateOne({
+    $unset: {
+      loginAttempts: 1,
+      lockUntil: 1
+    }
+  });
+};
+
+// 静态方法：查找未锁定的用户
+userSchema.statics.findByEmail = function(email) {
+  return this.findOne({
+    email,
+    isActive: true,
+    isBanned: false,
+    $or: [
+      { lockUntil: { $exists: false } },
+      { lockUntil: { $lt: Date.now() } }
+    ]
+  });
+};
 
 const User = mongoose.model('User', userSchema);
-const Category = mongoose.model('Category', categorySchema);
-const Post = mongoose.model('Post', postSchema);
-const Comment = mongoose.model('Comment', commentSchema);
 
-module.exports = {
-  User,
-  Category,
-  Post,
-  Comment
-};
+module.exports = User;
